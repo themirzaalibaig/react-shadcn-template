@@ -1,10 +1,16 @@
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import './index.css'
-import App from './App.tsx'
+import { createBrowserRouter, RouterProvider } from 'react-router-dom'
+import { routes } from './routes'
+import { ReduxProvider } from '@/redux/Provider'
+
+const router = createBrowserRouter(routes)
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
-    <App />
+    <ReduxProvider>
+      <RouterProvider router={router} />
+    </ReduxProvider>
   </StrictMode>,
 )

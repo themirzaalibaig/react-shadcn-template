@@ -5,7 +5,7 @@ import { Link } from 'react-router-dom'
 import { increment } from '@/redux/slice/counter.slice'
 import { useAppDispatch, useAppSelector } from '@/redux/store'
 
-export function App() {
+export const App = () => {
   const dispatch = useAppDispatch()
   const count = useAppSelector((state) => state.counter.value)
 

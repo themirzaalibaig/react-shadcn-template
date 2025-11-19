@@ -42,10 +42,14 @@ export interface UseApiOptions<TData = any, TError = any, TVariables = any> {
   headers?: Record<string, string>
   toastOptions?: ToastOptions
   axiosConfig?: AxiosRequestConfig
-  queryConfig?: UseQueryOptions<TData, TError, TData>
+  queryConfig?: Partial<UseQueryOptions<TData, TError, TData>>
   debounceMs?: number
   throttleMs?: number
   optimisticUpdate?: (oldData: TData | undefined, variables: TVariables) => TData
+  autoOptimistic?: boolean
+  collectionPath?: string
+  getId?: (item: any) => any
+  silent?: boolean
   onSuccess?: (data: TData) => void
   onError?: (error: TError) => void
   enableTokenRefresh?: boolean
@@ -77,6 +81,8 @@ export interface InfiniteApiRequest {
 export interface UseApiReturn<TData = any, TError = any, TVariables = any> {
   data: TData | undefined
   response: AxiosResponse<TData> | undefined
+  meta?: ResponseMeta | undefined
+  validationErrors?: ValidationError[] | null
   isLoading: boolean
   isFetching: boolean
   isPending: boolean

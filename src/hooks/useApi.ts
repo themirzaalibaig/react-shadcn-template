@@ -1,69 +1,18 @@
 /* eslint-disable @typescript-eslint/no-unused-vars */
 import { useQuery, useInfiniteQuery, useMutation, useQueryClient, useQueries } from '@tanstack/react-query'
-import axios from 'axios'
-import type { AxiosInstance, AxiosRequestConfig, AxiosResponse } from 'axios'
+import type { AxiosRequestConfig, AxiosResponse } from 'axios'
 import { useCallback, useState } from 'react'
 import type { UseInfiniteQueryOptions, InfiniteData } from '@tanstack/react-query'
-import type { ApiRequest, ParallelRequest, InfiniteApiRequest, UseApiReturn, ApiClientConfig, UseApiOptions } from '../types'
-
-const apiClient: AxiosInstance = axios.create({
-  baseURL: import.meta.env.VITE_API_URL || 'https://api.example.com',
-  timeout: 15000,
-})
-
-let apiConfig: ApiClientConfig = {
-  enableTokenRefresh: false,
-  refreshUrl: '/auth/refresh',
-  refreshMethod: 'post',
-  getRefreshPayload: () => ({ refresh_token: localStorage.getItem('refresh_token') || '' }),
-  extractTokens: (res: any) => ({ accessToken: res?.data?.access_token, refreshToken: res?.data?.refresh_token }),
-  accessTokenKey: 'access_token',
-  refreshTokenKey: 'refresh_token',
-  authorizationHeader: 'Authorization',
-}
+import type { ApiRequest, ParallelRequest, InfiniteApiRequest, UseApiReturn, UseApiOptions, ResponseMeta, ValidationError } from '../types'
+import { api } from '@/lib/axios'
+import { useDebounce, useThrottle } from '@reactuses/core'
+import { toast } from 'react-toastify'
+import { get, set, cloneDeep } from 'lodash'
 
 const debounceTimers = new Map<string, { timer: any; resolvers: Array<(v: any) => void>; rejecters: Array<(e: any) => void> }>()
 const throttleMap = new Map<string, number>()
-let refreshPromise: Promise<void> | null = null
 
-apiClient.interceptors.request.use((config) => {
-  const token = localStorage.getItem(apiConfig.accessTokenKey || 'access_token')
-  if (token && config.headers) {
-    config.headers[apiConfig.authorizationHeader || 'Authorization'] = `Bearer ${token}`
-  }
-  return config
-})
-
-apiClient.interceptors.response.use(
-  (response) => response,
-  async (error) => {
-    if (axios.isCancel(error)) return Promise.reject(error)
-    const status = error?.response?.status
-    const original = error?.config
-    if (status === 401 && apiConfig.enableTokenRefresh && !original?._retry) {
-      if (!localStorage.getItem(apiConfig.refreshTokenKey || 'refresh_token')) return Promise.reject(error)
-      original._retry = true
-      if (!refreshPromise) {
-        refreshPromise = (async () => {
-          const payload = apiConfig.getRefreshPayload ? apiConfig.getRefreshPayload() : {}
-          const res = await apiClient.request({ url: apiConfig.refreshUrl || '/auth/refresh', method: apiConfig.refreshMethod || 'post', data: payload })
-          const tokens = apiConfig.extractTokens ? apiConfig.extractTokens(res) : { accessToken: res?.data?.access_token, refreshToken: res?.data?.refresh_token }
-          if (tokens?.accessToken) localStorage.setItem(apiConfig.accessTokenKey || 'access_token', tokens.accessToken as string)
-          if (tokens?.refreshToken) localStorage.setItem(apiConfig.refreshTokenKey || 'refresh_token', tokens.refreshToken as string)
-        })().finally(() => {
-          refreshPromise = null
-        })
-      }
-      await refreshPromise
-      return apiClient(original)
-    }
-    return Promise.reject(error)
-  }
-)
-
-export const configureApi = (cfg: Partial<ApiClientConfig>) => {
-  apiConfig = { ...apiConfig, ...cfg }
-}
+ 
 
 export const useApi = <TData = any, E = any, V = any>(
   queryKey: any[],
@@ -88,16 +37,21 @@ export const useApi = <TData = any, E = any, V = any>(
       }
       if (!authEnabled) {
         if (!cfg.headers) cfg.headers = {}
-        delete cfg.headers[apiConfig.authorizationHeader || 'Authorization']
+        delete cfg.headers['Authorization']
       }
-      return apiClient.request<R>(cfg)
+      return api.request<R>(cfg)
     },
     [defaultUrl, authEnabled]
   )
 
+  const keyStr = JSON.stringify(queryKey)
+  const debouncedKeyStr = useDebounce(keyStr, options?.debounceMs || 0)
+  const throttledKeyStr = useThrottle(debouncedKeyStr, options?.throttleMs || 0)
+  const effectiveQueryKey = JSON.parse(throttledKeyStr)
+
   const { refetchInterval: _polling, ...restQueryConfig } = (options?.queryConfig || {}) as any
   const query = useQuery<TData, E, TData>({
-    queryKey,
+    queryKey: effectiveQueryKey,
     queryFn: ({ signal }) => {
       const run = () => request<TData>({ url: defaultUrl, method: 'get' }, signal).then((res) => res.data as TData)
       const k = JSON.stringify(queryKey)
@@ -164,18 +118,68 @@ export const useApi = <TData = any, E = any, V = any>(
       }).then((res) => res.data as TData)
     },
     onMutate: async (variables) => {
-      if (options?.optimisticUpdate) {
+      const auto = options?.autoOptimistic ?? true
+      if (options?.optimisticUpdate || auto) {
         await queryClient.cancelQueries({ queryKey })
         const previous = queryClient.getQueryData<TData>(queryKey)
-        queryClient.setQueryData(queryKey, options.optimisticUpdate(previous, variables))
+        if (options?.optimisticUpdate) {
+          queryClient.setQueryData(queryKey, options.optimisticUpdate(previous, variables))
+          return { previous }
+        }
+        const updated = (() => {
+          if (!previous) return previous as TData
+          const method = options?.method || 'post'
+          const idGetter = options?.getId || ((x: any) => x?.id)
+          const path = options?.collectionPath
+          const draft = cloneDeep(previous as any)
+          const target = path ? get(draft, path) : Array.isArray(draft) ? draft : Object.values(draft).find((v) => Array.isArray(v))
+          if (!target) return previous as TData
+          if (method === 'post') {
+            const item = (variables as any) ?? {}
+            if (Array.isArray(target)) (target as any[]).push(item)
+          } else if (method === 'put' || method === 'patch') {
+            const item = (variables as any) ?? {}
+            const id = idGetter(item)
+            if (Array.isArray(target)) {
+              const idx = (target as any[]).findIndex((x) => idGetter(x) === id)
+              if (idx >= 0) (target as any[])[idx] = { ...(target as any[])[idx], ...item }
+            }
+          } else if (method === 'delete') {
+            const id = idGetter(variables as any)
+            if (Array.isArray(target)) {
+              const idx = (target as any[]).findIndex((x) => idGetter(x) === id)
+              if (idx >= 0) (target as any[]).splice(idx, 1)
+            }
+          }
+          if (path) set(draft, path, target)
+          return draft as TData
+        })()
+        queryClient.setQueryData(queryKey, updated)
         return { previous }
       }
       return {}
+    },
+    onSuccess: (data) => {
+      if (!options?.silent) {
+        const msg = (data && typeof data === 'object' && (data as any).message) || 'Success'
+        toast.success(String(msg))
+      }
+      options?.onSuccess?.(data)
     },
     onError: (_, __, context: any) => {
       if (context?.previous) {
         queryClient.setQueryData(queryKey, context.previous as TData)
       }
+      if (!options?.silent) {
+        const err: any = __ as any
+        const r = err?.response?.data
+        const hasValidation = Array.isArray(r?.errors) && r.errors.length > 0
+        if (!hasValidation) {
+          const msg = (r && r.message) || err?.message || 'Error'
+          toast.error(String(msg))
+        }
+      }
+      if (options?.onError) options.onError(__ as any)
     },
     onSettled: () => {
       queryClient.invalidateQueries({ queryKey })
@@ -186,7 +190,7 @@ export const useApi = <TData = any, E = any, V = any>(
     return useQueries({
       queries: requests.map(({ key, request, options }) => ({
         queryKey: Array.isArray(key) ? key : [key],
-        queryFn: ({ signal }) => apiClient.request<P>({ ...request, signal }).then((res) => res.data as P),
+        queryFn: ({ signal }) => api.request<P>({ ...request, signal }).then((res) => res.data as P),
         ...options,
       })),
     }).map((q, i) => ({
@@ -206,7 +210,7 @@ export const useApi = <TData = any, E = any, V = any>(
     const files = Array.isArray(file) ? file : [file]
     const formData = new FormData()
     files.forEach((f) => formData.append('files', f))
-    return apiClient.post(defaultUrl, formData, {
+    return api.post(defaultUrl, formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
       ...config,
     })
@@ -256,14 +260,21 @@ export const useApi = <TData = any, E = any, V = any>(
   const setAuth = (enabled: boolean, token?: string) => {
     setAuthEnabled(enabled)
     if (token !== undefined) {
-      if (enabled && token) localStorage.setItem(apiConfig.accessTokenKey || 'access_token', token)
-      else localStorage.removeItem(apiConfig.accessTokenKey || 'access_token')
+      if (enabled && token) localStorage.setItem('access_token', token)
+      else localStorage.removeItem('access_token')
     }
   }
 
+  const raw = query.data as any
+  const meta: ResponseMeta | undefined = raw && raw.meta ? (raw.meta as ResponseMeta) : undefined
+  const payload = raw && raw.success !== undefined && raw.timestamp ? raw.data ?? undefined : raw
+  const extracted = typeof payload === 'object' && payload ? payload : undefined
+
   return {
-    data: query.data,
-    response: query.data ? ({ data: query.data } as AxiosResponse<TData>) : undefined,
+    data: payload as TData | undefined,
+    response: query.data ? ({ data: payload } as AxiosResponse<TData>) : undefined,
+    meta,
+    validationErrors: raw && raw.errors ? (raw.errors as ValidationError[] | null) : null,
     isLoading: query.isLoading,
     isFetching: query.isFetching,
     isPending: query.isPending || mutation.isPending,
@@ -274,11 +285,79 @@ export const useApi = <TData = any, E = any, V = any>(
     isMutating: mutation.isPending,
     mutate: mutation.mutate,
     mutateAsync: mutation.mutateAsync,
-    get: (config) => request({ method: 'get', url: defaultUrl, config }),
-    post: (data, config) => request({ method: 'post', url: defaultUrl, data, config }),
-    put: (data, config) => request({ method: 'put', url: defaultUrl, data, config }),
-    patch: (data, config) => request({ method: 'patch', url: defaultUrl, data, config }),
-    del: (config) => request({ method: 'delete', url: defaultUrl, config }),
+    get: (config?: AxiosRequestConfig) => request({ method: 'get', url: defaultUrl, config }),
+    post: (data?: V, config?: AxiosRequestConfig) =>
+      request<TData>({ method: 'post', url: defaultUrl, data, config }).then((res) => {
+        if (!options?.silent) {
+          const msg = (res?.data && (res.data as any).message) || 'Success'
+          toast.success(String(msg))
+        }
+        return res as AxiosResponse<TData>
+      }).catch((err: any) => {
+        if (!options?.silent) {
+          const r = err?.response?.data
+          const hasValidation = Array.isArray(r?.errors) && r.errors.length > 0
+          if (!hasValidation) {
+            const msg = (r && r.message) || err?.message || 'Error'
+            toast.error(String(msg))
+          }
+        }
+        throw err
+      }),
+    put: (data?: V, config?: AxiosRequestConfig) =>
+      request<TData>({ method: 'put', url: defaultUrl, data, config }).then((res) => {
+        if (!options?.silent) {
+          const msg = (res?.data && (res.data as any).message) || 'Success'
+          toast.success(String(msg))
+        }
+        return res as AxiosResponse<TData>
+      }).catch((err: any) => {
+        if (!options?.silent) {
+          const r = err?.response?.data
+          const hasValidation = Array.isArray(r?.errors) && r.errors.length > 0
+          if (!hasValidation) {
+            const msg = (r && r.message) || err?.message || 'Error'
+            toast.error(String(msg))
+          }
+        }
+        throw err
+      }),
+    patch: (data?: V, config?: AxiosRequestConfig) =>
+      request<TData>({ method: 'patch', url: defaultUrl, data, config }).then((res) => {
+        if (!options?.silent) {
+          const msg = (res?.data && (res.data as any).message) || 'Success'
+          toast.success(String(msg))
+        }
+        return res as AxiosResponse<TData>
+      }).catch((err: any) => {
+        if (!options?.silent) {
+          const r = err?.response?.data
+          const hasValidation = Array.isArray(r?.errors) && r.errors.length > 0
+          if (!hasValidation) {
+            const msg = (r && r.message) || err?.message || 'Error'
+            toast.error(String(msg))
+          }
+        }
+        throw err
+      }),
+    del: (config?: AxiosRequestConfig) =>
+      request<TData>({ method: 'delete', url: defaultUrl, config }).then((res) => {
+        if (!options?.silent) {
+          const msg = (res?.data && (res.data as any).message) || 'Success'
+          toast.success(String(msg))
+        }
+        return res as AxiosResponse<TData>
+      }).catch((err: any) => {
+        if (!options?.silent) {
+          const r = err?.response?.data
+          const hasValidation = Array.isArray(r?.errors) && r.errors.length > 0
+          if (!hasValidation) {
+            const msg = (r && r.message) || err?.message || 'Error'
+            toast.error(String(msg))
+          }
+        }
+        throw err
+      }),
     request,
     uploadFile,
     parallel: useParallelApi,
@@ -291,7 +370,8 @@ export const useApi = <TData = any, E = any, V = any>(
     remove,
     setAuth,
     makeKey,
-  }
+    ...(extracted || {}),
+  } as unknown as UseApiReturn<TData, E, V> & (TData extends object ? Partial<TData> : object)
 }
 
-export { apiClient }
+export { api as apiClient }
